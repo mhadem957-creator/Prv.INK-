@@ -1,27 +1,29 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter_downloader/flutter_downloader.dart'
-    show DownloadTaskStatus;
-import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:flutter_downloader/flutter_downloader.dart';
 import 'package:open_filex/open_filex.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
-/// Reliable in-app downloads with public folder copy + notifications.
+/// Top-level callback required by flutter_downloader (runs in background isolate).
+@pragma('vm:entry-point')
+void inkDownloadCallback(String id, int status, int progress) {
+  final SendPort? send =
+      IsolateNameServer.lookupPortByName('ink_downloader_send_port');
+  send?.send([id, status, progress]);
+}
+
+/// Reliable background downloads powered by flutter_downloader.
+/// Survives app backgrounding / leaving the app.
 class DownloadService extends ChangeNotifier {
   DownloadService._();
   static final DownloadService instance = DownloadService._();
 
   final List<DownloadItem> _items = [];
   bool _initialized = false;
-  final Map<String, HttpClient> _clients = {};
-  final Map<String, bool> _cancel = {};
-  final FlutterLocalNotificationsPlugin _notifs =
-      FlutterLocalNotificationsPlugin();
-  bool _notifsReady = false;
-  int _notifIdSeq = 1000;
+  ReceivePort? _port;
 
   List<DownloadItem> get items => List.unmodifiable(_items);
   List<DownloadItem> get active => _items
@@ -42,73 +44,123 @@ class DownloadService extends ChangeNotifier {
   Future<void> initialize() async {
     if (_initialized) return;
     _initialized = true;
-    await _initNotifications();
+
+    // Register the background isolate callback once.
+    FlutterDownloader.registerCallback(inkDownloadCallback);
+
+    // Listen for progress updates coming from the background isolate.
+    _port = ReceivePort();
+    IsolateNameServer.removePortNameMapping('ink_downloader_send_port');
+    IsolateNameServer.registerPortWithName(
+      _port!.sendPort,
+      'ink_downloader_send_port',
+    );
+    _port!.listen(_onBackgroundUpdate);
+
+    // Restore any tasks that were running when the app was last closed.
+    await _loadExistingTasks();
   }
 
-  Future<void> rebind() async {}
-
-  Future<void> _initNotifications() async {
-    if (_notifsReady) return;
-    try {
-      const android = AndroidInitializationSettings('@mipmap/ic_launcher');
-      const init = InitializationSettings(android: android);
-      await _notifs.initialize(init);
-      // Android 13+ notification permission is requested in _ensurePermissions
-      final androidPlugin = _notifs.resolvePlatformSpecificImplementation<
-          AndroidFlutterLocalNotificationsPlugin>();
-      await androidPlugin?.createNotificationChannel(
-        const AndroidNotificationChannel(
-          'ink_downloads',
-          'Downloads',
-          description: 'INK download progress and completion',
-          importance: Importance.low,
-        ),
+  /// Called when the app returns to the foreground.
+  Future<void> rebind() async {
+    if (!_initialized) {
+      await initialize();
+      return;
+    }
+    // Re-register the port in case the isolate was recycled.
+    IsolateNameServer.removePortNameMapping('ink_downloader_send_port');
+    if (_port != null) {
+      IsolateNameServer.registerPortWithName(
+        _port!.sendPort,
+        'ink_downloader_send_port',
       );
-      _notifsReady = true;
+    }
+    await _loadExistingTasks();
+  }
+
+  void _onBackgroundUpdate(dynamic data) {
+    if (data is! List || data.length < 3) return;
+    final taskId = data[0] as String;
+    DownloadTaskStatus status;
+    try {
+      status = DownloadTaskStatus.fromInt(data[1] as int);
+    } catch (_) {
+      final idx = data[1] as int;
+      status = (idx >= 0 && idx < DownloadTaskStatus.values.length)
+          ? DownloadTaskStatus.values[idx]
+          : DownloadTaskStatus.undefined;
+    }
+    final progress = data[2] as int;
+
+    final item = _find(taskId);
+    if (item == null) return;
+
+    item.status = status;
+    item.progress = progress.clamp(0, 100);
+
+    if (status == DownloadTaskStatus.complete) {
+      item.progress = 100;
+      item.error = null;
+      // Best-effort: try to surface the final path.
+      unawaited(_refreshTaskPath(item));
+    } else if (status == DownloadTaskStatus.failed) {
+      item.error ??= 'Download failed';
+    }
+
+    notifyListeners();
+  }
+
+  Future<void> _loadExistingTasks() async {
+    try {
+      final tasks = await FlutterDownloader.loadTasks();
+      if (tasks == null) return;
+
+      for (final t in tasks) {
+        final existing = _find(t.taskId);
+        if (existing != null) {
+          existing.status = t.status;
+          existing.progress = t.progress;
+          existing.fileName = t.filename ?? existing.fileName;
+          existing.savedDir = t.savedDir;
+          continue;
+        }
+
+        // Only keep recent / interesting tasks in the UI list.
+        if (t.status == DownloadTaskStatus.complete ||
+            t.status == DownloadTaskStatus.running ||
+            t.status == DownloadTaskStatus.enqueued ||
+            t.status == DownloadTaskStatus.paused ||
+            t.status == DownloadTaskStatus.failed) {
+          _items.add(DownloadItem(
+            taskId: t.taskId,
+            url: t.url,
+            fileName: t.filename ?? 'download',
+            savedDir: t.savedDir,
+            progress: t.progress,
+            status: t.status,
+          ));
+        }
+      }
+      // Newest first
+      _items.sort((a, b) => b.taskId.compareTo(a.taskId));
+      notifyListeners();
     } catch (e) {
-      debugPrint('notifications init: $e');
+      debugPrint('loadTasks error: $e');
     }
   }
 
-  Future<void> _notify({
-    required int id,
-    required String title,
-    required String body,
-    bool ongoing = false,
-    int? progress,
-    int? maxProgress,
-  }) async {
-    if (!_notifsReady) return;
+  Future<void> _refreshTaskPath(DownloadItem item) async {
     try {
-      await _notifs.show(
-        id,
-        title,
-        body,
-        NotificationDetails(
-          android: AndroidNotificationDetails(
-            'ink_downloads',
-            'Downloads',
-            channelDescription: 'INK download progress and completion',
-            importance: ongoing ? Importance.low : Importance.defaultImportance,
-            priority: ongoing ? Priority.low : Priority.defaultPriority,
-            ongoing: ongoing,
-            onlyAlertOnce: true,
-            showProgress: progress != null,
-            maxProgress: maxProgress ?? 100,
-            progress: progress ?? 0,
-            indeterminate: ongoing && progress == null,
-            icon: '@mipmap/ic_launcher',
-          ),
-        ),
+      final tasks = await FlutterDownloader.loadTasksWithRawQuery(
+        query: "SELECT * FROM task WHERE task_id='${item.taskId}'",
       );
-    } catch (e) {
-      debugPrint('notify error: $e');
-    }
-  }
-
-  Future<void> _cancelNotif(int id) async {
-    try {
-      await _notifs.cancel(id);
+      if (tasks != null && tasks.isNotEmpty) {
+        final t = tasks.first;
+        item.savedDir = t.savedDir;
+        if (t.filename != null && t.filename!.isNotEmpty) {
+          item.fileName = t.filename!;
+        }
+      }
     } catch (_) {}
   }
 
@@ -154,10 +206,10 @@ class DownloadService extends ChangeNotifier {
     try {
       if (await Permission.storage.isDenied) await Permission.storage.request();
     } catch (_) {}
+    // Android 11+ : needed to write into public Download folder on some devices
     try {
-      // Helps writing into public Download/ on some OEMs
       if (await Permission.manageExternalStorage.isDenied) {
-        // Don't force settings sheet every time — best effort only once later
+        await Permission.manageExternalStorage.request();
       }
     } catch (_) {}
     if (forApk) {
@@ -169,34 +221,20 @@ class DownloadService extends ChangeNotifier {
     }
   }
 
-  /// App-private working directory (always writable).
-  Future<String> _privateDir() async {
-    try {
-      final ext = await getExternalStorageDirectory();
-      if (ext != null) {
-        final dir = Directory('${ext.path}/Downloads');
-        if (!await dir.exists()) await dir.create(recursive: true);
-        return dir.path;
-      }
-    } catch (_) {}
-    final docs = await getApplicationDocumentsDirectory();
-    final dir = Directory('${docs.path}/Downloads');
-    if (!await dir.exists()) await dir.create(recursive: true);
-    return dir.path;
-  }
-
-  /// Public folder visible in the system Files app: Download/INK/
-  Future<String?> _publicDir() async {
+  /// Public phone Downloads folder ONLY — never the app-private directory.
+  /// Files appear in the system Files / Downloads app.
+  Future<String> _saveDir() async {
     final candidates = <String>[
-      '/storage/emulated/0/Download/INK',
-      '/storage/emulated/0/Downloads/INK',
-      '/sdcard/Download/INK',
+      '/storage/emulated/0/Download',
+      '/storage/emulated/0/Downloads',
+      '/sdcard/Download',
+      '/sdcard/Downloads',
     ];
     for (final path in candidates) {
       try {
         final dir = Directory(path);
         if (!await dir.exists()) await dir.create(recursive: true);
-        final probe = File('${dir.path}/.ink_w');
+        final probe = File('${dir.path}/.ink_write_test');
         await probe.writeAsString('ok', flush: true);
         await probe.delete();
         return dir.path;
@@ -204,7 +242,25 @@ class DownloadService extends ChangeNotifier {
         debugPrint('public dir fail $path: $e');
       }
     }
-    return null;
+    // Last resort still public (no app-private path).
+    throw StateError(
+      'Cannot write to public Download folder. '
+      'Grant "All files access" / storage permission.',
+    );
+  }
+
+  String _safeFileName(String raw) {
+    var name = raw.split('?').first.split('#').first;
+    if (name.contains('/')) name = name.split('/').last;
+    name = name.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_').trim();
+    if (name.isEmpty || name == '.' || name == '..') {
+      name = 'download_${DateTime.now().millisecondsSinceEpoch}';
+    }
+    if (name.length > 120) {
+      final ext = name.contains('.') ? '.${name.split('.').last}' : '';
+      name = '${name.substring(0, 120 - ext.length)}$ext';
+    }
+    return name;
   }
 
   Future<String> _uniqueName(String dir, String name) async {
@@ -220,20 +276,6 @@ class DownloadService extends ChangeNotifier {
       if (i > 200) break;
     }
     return candidate;
-  }
-
-  String _safeFileName(String raw) {
-    var name = raw.split('?').first.split('#').first;
-    if (name.contains('/')) name = name.split('/').last;
-    name = name.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_').trim();
-    if (name.isEmpty || name == '.' || name == '..') {
-      name = 'download_${DateTime.now().millisecondsSinceEpoch}';
-    }
-    if (name.length > 120) {
-      final ext = name.contains('.') ? '.${name.split('.').last}' : '';
-      name = '${name.substring(0, 120 - ext.length)}$ext';
-    }
-    return name;
   }
 
   Future<String?> enqueue({
@@ -265,279 +307,113 @@ class DownloadService extends ChangeNotifier {
     }
 
     await _ensurePermissions(forApk: name.toLowerCase().endsWith('.apk'));
-    final privateDir = await _privateDir();
-    name = await _uniqueName(privateDir, name);
-    final taskId = 'ink_${DateTime.now().microsecondsSinceEpoch}';
-    final notifId = ++_notifIdSeq;
-
-    // Soft limit concurrent downloads to keep the UI responsive.
-    final running = _items
-        .where((e) => e.status == DownloadTaskStatus.running)
-        .length;
-    if (running >= 3) {
-      // Still enqueue — will run; user sees it queued.
-    }
-
-    final item = DownloadItem(
-      taskId: taskId,
-      url: url,
-      fileName: name,
-      savedDir: privateDir,
-      progress: 0,
-      status: DownloadTaskStatus.enqueued,
-      notifId: notifId,
-    );
-    _items.insert(0, item);
-    notifyListeners();
-
-    await _notify(
-      id: notifId,
-      title: 'Downloading',
-      body: name,
-      ongoing: true,
-      progress: 0,
-      maxProgress: 100,
-    );
-
-    unawaited(_download(item));
-    return taskId;
-  }
-
-  Future<void> _download(DownloadItem item) async {
-    final client = HttpClient()
-      ..connectionTimeout = const Duration(seconds: 45)
-      ..idleTimeout = const Duration(minutes: 5)
-      ..autoUncompress = true
-      ..badCertificateCallback = (cert, host, port) => true;
-
-    _clients[item.taskId] = client;
-    _cancel[item.taskId] = false;
-
-    final dest = '${item.savedDir}/${item.fileName}';
-    final part = '$dest.part';
+    final savedDir = await _saveDir();
+    name = await _uniqueName(savedDir, name);
 
     try {
-      item.status = DownloadTaskStatus.running;
-      item.error = null;
-      item.progress = 0;
-      notifyListeners();
-
-      var uri = Uri.parse(item.url);
-      HttpClientResponse? response;
-
-      for (var hop = 0; hop < 10; hop++) {
-        final req = await client.getUrl(uri);
-        req.followRedirects = false;
-        req.headers.set(
-          HttpHeaders.userAgentHeader,
-          'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36',
-        );
-        req.headers.set(HttpHeaders.acceptHeader, '*/*');
-        req.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
-        response = await req.close();
-
-        if (response.statusCode >= 300 &&
-            response.statusCode < 400 &&
-            response.headers.value(HttpHeaders.locationHeader) != null) {
-          final loc = response.headers.value(HttpHeaders.locationHeader)!;
-          uri = uri.resolve(loc);
-          await response.drain<void>();
-          continue;
-        }
-        break;
-      }
-
-      if (response == null) throw const HttpException('No response');
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw HttpException('HTTP ${response.statusCode}');
-      }
-
-      final cd = response.headers.value('content-disposition');
-      if (cd != null) {
-        final m =
-            RegExp(r'filename\*?=([^;]+)', caseSensitive: false).firstMatch(cd);
-        if (m != null) {
-          var raw = m.group(1)!.trim();
-          if (raw.toLowerCase().startsWith("utf-8''")) {
-            raw = raw.substring(7);
-          }
-          raw = raw.replaceAll('"', '').replaceAll("'", '');
-          try {
-            raw = Uri.decodeFull(raw);
-          } catch (_) {}
-          final suggested = _safeFileName(raw);
-          if (suggested.isNotEmpty) item.fileName = suggested;
-        }
-      }
-
-      final total = response.contentLength;
-      final file = File(part);
-      final sink = file.openWrite();
-      var received = 0;
-      var lastPct = -1;
-      var lastNotifPct = -1;
-
-      await for (final chunk in response) {
-        if (_cancel[item.taskId] == true) {
-          await sink.close();
-          try {
-            if (await file.exists()) await file.delete();
-          } catch (_) {}
-          item.status = DownloadTaskStatus.canceled;
-          item.progress = 0;
-          notifyListeners();
-          await _cancelNotif(item.notifId);
-          return;
-        }
-        sink.add(chunk);
-        received += chunk.length;
-        if (total > 0) {
-          final pct = ((received * 100) / total).floor().clamp(0, 100);
-          if (pct != lastPct) {
-            lastPct = pct;
-            item.progress = pct;
-            notifyListeners();
-          }
-          // Update notification every 5%
-          if (pct - lastNotifPct >= 5 || pct == 100) {
-            lastNotifPct = pct;
-            await _notify(
-              id: item.notifId,
-              title: 'Downloading',
-              body: '${item.fileName} · $pct%',
-              ongoing: true,
-              progress: pct,
-              maxProgress: 100,
-            );
-          }
-        } else if (received % (256 * 1024) < chunk.length) {
-          item.progress = (item.progress + 1).clamp(0, 95);
-          notifyListeners();
-          await _notify(
-            id: item.notifId,
-            title: 'Downloading',
-            body: item.fileName,
-            ongoing: true,
-          );
-        }
-      }
-      await sink.flush();
-      await sink.close();
-
-      final privateOut = File('${item.savedDir}/${item.fileName}');
-      if (await privateOut.exists()) await privateOut.delete();
-      await file.rename(privateOut.path);
-
-      // Copy into public Download/INK so it appears in the phone Files app.
-      final publicDir = await _publicDir();
-      if (publicDir != null) {
-        try {
-          final publicPath = '$publicDir/${item.fileName}';
-          await privateOut.copy(publicPath);
-          item.publicPath = publicPath;
-          item.savedDir = publicDir; // show public path in UI
-          debugPrint('Copied to public: $publicPath');
-        } catch (e) {
-          debugPrint('public copy failed: $e');
-          // keep private path — still openable from the app
-        }
-      }
-
-      item.progress = 100;
-      item.status = DownloadTaskStatus.complete;
-      item.error = null;
-      notifyListeners();
-
-      await _notify(
-        id: item.notifId,
-        title: 'Download complete',
-        body: item.fileName,
-        ongoing: false,
-        progress: 100,
-        maxProgress: 100,
+      final taskId = await FlutterDownloader.enqueue(
+        url: url,
+        savedDir: savedDir,
+        fileName: name,
+        showNotification: showNotification,
+        openFileFromNotification: true,
+        allowCellular: true,
+        saveInPublicStorage: true,
       );
-      debugPrint('INK download OK → ${item.filePath} ($received bytes)');
+
+      if (taskId == null) {
+        debugPrint('FlutterDownloader.enqueue returned null');
+        return null;
+      }
+
+      final item = DownloadItem(
+        taskId: taskId,
+        url: url,
+        fileName: name,
+        savedDir: savedDir,
+        progress: 0,
+        status: DownloadTaskStatus.enqueued,
+      );
+      _items.insert(0, item);
+      notifyListeners();
+      return taskId;
     } catch (e, st) {
-      debugPrint('INK download FAIL: $e\n$st');
-      item.status = DownloadTaskStatus.failed;
-      item.error = e.toString();
-      notifyListeners();
-      await _notify(
-        id: item.notifId,
-        title: 'Download failed',
-        body: item.fileName,
-        ongoing: false,
-      );
-      try {
-        final f = File(part);
-        if (await f.exists()) await f.delete();
-      } catch (_) {}
-    } finally {
-      try {
-        client.close(force: true);
-      } catch (_) {}
-      _clients.remove(item.taskId);
-      _cancel.remove(item.taskId);
+      debugPrint('enqueue failed: $e\n$st');
+      return null;
     }
   }
 
-  Future<void> pause(String taskId) async => cancel(taskId);
+  Future<void> pause(String taskId) async {
+    try {
+      await FlutterDownloader.pause(taskId: taskId);
+      final item = _find(taskId);
+      if (item != null) {
+        item.status = DownloadTaskStatus.paused;
+        notifyListeners();
+      }
+    } catch (e) {
+      debugPrint('pause error: $e');
+    }
+  }
 
   Future<void> resume(String taskId) async {
     final item = _find(taskId);
     if (item == null) return;
-    if (item.status == DownloadTaskStatus.canceled ||
-        item.status == DownloadTaskStatus.failed) {
-      item.progress = 0;
-      item.status = DownloadTaskStatus.enqueued;
-      item.error = null;
-      notifyListeners();
-      await _notify(
-        id: item.notifId,
-        title: 'Downloading',
-        body: item.fileName,
-        ongoing: true,
-        progress: 0,
-        maxProgress: 100,
-      );
-      unawaited(_download(item));
+
+    try {
+      if (item.status == DownloadTaskStatus.paused) {
+        final newId = await FlutterDownloader.resume(taskId: taskId);
+        if (newId != null && newId != taskId) {
+          // Plugin sometimes returns a new task id on resume.
+          item.taskId = newId;
+        }
+        item.status = DownloadTaskStatus.running;
+        notifyListeners();
+        return;
+      }
+
+      // Failed / canceled → re-enqueue
+      if (item.status == DownloadTaskStatus.failed ||
+          item.status == DownloadTaskStatus.canceled) {
+        final url = item.url;
+        final name = item.fileName;
+        await remove(taskId, deleteFile: false);
+        await enqueue(url: url, fileName: name);
+      }
+    } catch (e) {
+      debugPrint('resume error: $e');
+      // Fallback: re-enqueue
+      final url = item.url;
+      final name = item.fileName;
+      await remove(taskId, deleteFile: false);
+      await enqueue(url: url, fileName: name);
     }
   }
 
   Future<void> cancel(String taskId) async {
-    _cancel[taskId] = true;
     try {
-      _clients[taskId]?.close(force: true);
+      await FlutterDownloader.cancel(taskId: taskId);
     } catch (_) {}
     final item = _find(taskId);
-    if (item != null &&
-        (item.status == DownloadTaskStatus.running ||
-            item.status == DownloadTaskStatus.enqueued)) {
+    if (item != null) {
       item.status = DownloadTaskStatus.canceled;
       notifyListeners();
-      await _cancelNotif(item.notifId);
     }
   }
 
   Future<void> remove(String taskId, {bool deleteFile = false}) async {
-    await cancel(taskId);
-    final item = _find(taskId);
-    if (item != null && deleteFile) {
-      for (final path in [item.filePath, item.publicPath]) {
-        if (path == null) continue;
-        try {
-          final f = File(path);
-          if (await f.exists()) await f.delete();
-        } catch (_) {}
-      }
-    }
-    if (item != null) await _cancelNotif(item.notifId);
+    try {
+      await FlutterDownloader.remove(
+        taskId: taskId,
+        shouldDeleteContent: deleteFile,
+      );
+    } catch (_) {}
     _items.removeWhere((e) => e.taskId == taskId);
     notifyListeners();
   }
 
   Future<void> refresh() async {
-    notifyListeners();
+    await _loadExistingTasks();
   }
 
   DownloadItem? _find(String id) {
@@ -548,17 +424,23 @@ class DownloadService extends ChangeNotifier {
   }
 
   Future<OpenResult> openFile(DownloadItem item) async {
-    final path = item.publicPath ?? item.filePath;
+    final path = item.filePath;
     if (path == null || !File(path).existsSync()) {
+      // Try asking the plugin for the path
+      try {
+        await FlutterDownloader.open(taskId: item.taskId);
+        return const OpenResult(type: ResultType.done, message: 'opened');
+      } catch (_) {}
       return OpenResult(
         type: ResultType.error,
         message: 'File not found: $path',
       );
     }
+
     if (item.fileName.toLowerCase().endsWith('.apk') && Platform.isAndroid) {
       final status = await Permission.requestInstallPackages.request();
       if (!status.isGranted) {
-        return OpenResult(
+        return const OpenResult(
           type: ResultType.permissionDenied,
           message: 'Install packages permission denied',
         );
@@ -581,7 +463,7 @@ class DownloadItem {
     this.notifId = 0,
   });
 
-  final String taskId;
+  String taskId;
   final String url;
   String fileName;
   String savedDir;
