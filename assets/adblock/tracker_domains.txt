@@ -1,5 +1,6 @@
 # INK Tracker Blocklist — analytics, fingerprinting, beacons.
 # One host (or host fragment) per line. Human-auditable.
+# Avoid overly broad roots that break real sites (facebook.com, google.com, etc.).
 
 # Google Analytics & Tag Manager
 google-analytics.com
@@ -10,6 +11,7 @@ analytics.google.com
 region1.google-analytics.com
 stats.g.doubleclick.net
 www.googletagmanager.com
+tagmanager.google.com
 
 # Major analytics platforms
 scorecardresearch.com
@@ -32,7 +34,24 @@ inspectlet.com
 sessioncam.com
 smartlook.com
 clarity.ms
-microsoft.com/clarity
+contentsquare.com
+contentsquare.net
+hotjar.io
+logrocket.com
+logrocket.io
+pendo.io
+walkme.com
+appcues.com
+intercom.io
+intercomcdn.com
+drift.com
+driftt.com
+olark.com
+tawk.to
+livechatinc.com
+crisp.chat
+userpilot.io
+userpilot.com
 
 # Mobile attribution & SDKs
 appsflyer.com
@@ -43,6 +62,15 @@ kochava.com
 singular.net
 tenjin.io
 airbridge.io
+apsalar.com
+localytics.com
+countly.com
+count.ly
+uxcam.com
+uxcam.net
+appsee.com
+crashlytics.com
+fabric.io
 
 # Data brokers / DMP
 tapad.com
@@ -65,6 +93,7 @@ liveramp.com
 id5-sync.com
 sharedid.org
 pubcid.org
+liadm.com
 
 # Fingerprinting / anti-fraud (often used for tracking)
 newrelic.com
@@ -78,14 +107,25 @@ perimeterx.net
 px-cdn.net
 px-client.net
 distilnetworks.com
-kaspersky-labs.com
 threatmetrix.com
 iovation.com
 devicefingerprint.com
+fingerprintjs.com
+fingerprint.com
+fpjs.io
+openfpcdn.io
+cdn.fpjs.io
+imperva.com
+incapsula.com
+datadome.co
+datadome.net
+cloudflareinsights.com
+static.cloudflareinsights.com
+rum.browser-intake.com
+browser-intake.com
 
-# Social trackers
+# Social trackers (specific endpoints / CDNs, not whole sites)
 connect.facebook.net
-facebook.com/tr
 pixel.facebook.com
 analytics.twitter.com
 static.ads-twitter.com
@@ -93,13 +133,52 @@ ads-api.twitter.com
 snap.licdn.com
 px.ads.linkedin.com
 ads.linkedin.com
-platform.linkedin.com
 sc-static.net
 tr.snapchat.com
 bat.bing.com
-bing.com/bat
-yandex.ru/metrika
 mc.yandex.ru
-vk.com/rtrg
+platform.twitter.com
+syndication.twitter.com
+cdn.syndication.twimg.com
+widgets.pinterest.com
+ct.pinterest.com
+log.pinterest.com
+analytics.pinterest.com
+ads.pinterest.com
+events.reddit.com
+alb.reddit.com
+pixel.reddit.com
 
-# Other common beacons
+# Common beacons & CDNs used purely for tracking
+beacon.scorecardresearch.com
+sb.scorecardresearch.com
+b.scorecardresearch.com
+cdn.optimizely.com
+optimizely.com
+cdn-pci.optimizely.com
+logx.optimizely.com
+cdn.segment.com
+api.segment.io
+cdn.amplitude.com
+api.amplitude.com
+cdn.mxpnl.com
+api.mixpanel.com
+cdn.heapanalytics.com
+cdn.fullstory.com
+rs.fullstory.com
+script.hotjar.com
+static.hotjar.com
+vars.hotjar.com
+script.crazyegg.com
+cdn.mouseflow.com
+cdn.inspectlet.com
+hn.inspectlet.com
+cdn.sessioncam.com
+ws.sessioncam.com
+cdn.smartlook.com
+rec.smartlook.com
+js.intercomcdn.com
+widget.intercom.io
+api.intercom.io
+js.driftt.com
+api.drift.com
