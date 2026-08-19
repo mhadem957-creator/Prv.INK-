@@ -10,6 +10,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 /// Top-level callback required by flutter_downloader (runs in background isolate).
+/// Must stay top-level + @pragma so it is not tree-shaken in release builds.
 @pragma('vm:entry-point')
 void inkDownloadCallback(String id, int status, int progress) {
   final SendPort? send =
@@ -17,8 +18,7 @@ void inkDownloadCallback(String id, int status, int progress) {
   send?.send([id, status, progress]);
 }
 
-/// Reliable background downloads powered by flutter_downloader.
-/// Survives app backgrounding / leaving the app.
+/// Background downloads via flutter_downloader.
 class DownloadService extends ChangeNotifier {
   DownloadService._();
   static final DownloadService instance = DownloadService._();
@@ -45,38 +45,43 @@ class DownloadService extends ChangeNotifier {
 
   Future<void> initialize() async {
     if (_initialized) return;
+
+    // 1) Bind isolate port FIRST (before registerCallback)
+    _bindPort();
+
+    // 2) Register background callback
+    try {
+      FlutterDownloader.registerCallback(inkDownloadCallback);
+    } catch (e) {
+      debugPrint('registerCallback: $e');
+    }
+
     _initialized = true;
+    await _loadExistingTasks();
+  }
 
-    // Register the background isolate callback once.
-    FlutterDownloader.registerCallback(inkDownloadCallback);
-
-    // Listen for progress updates coming from the background isolate.
+  void _bindPort() {
+    try {
+      IsolateNameServer.removePortNameMapping('ink_downloader_send_port');
+    } catch (_) {}
+    _port?.close();
     _port = ReceivePort();
-    IsolateNameServer.removePortNameMapping('ink_downloader_send_port');
     IsolateNameServer.registerPortWithName(
       _port!.sendPort,
       'ink_downloader_send_port',
     );
     _port!.listen(_onBackgroundUpdate);
-
-    // Restore any tasks that were running when the app was last closed.
-    await _loadExistingTasks();
   }
 
-  /// Called when the app returns to the foreground.
   Future<void> rebind() async {
     if (!_initialized) {
       await initialize();
       return;
     }
-    // Re-register the port in case the isolate was recycled.
-    IsolateNameServer.removePortNameMapping('ink_downloader_send_port');
-    if (_port != null) {
-      IsolateNameServer.registerPortWithName(
-        _port!.sendPort,
-        'ink_downloader_send_port',
-      );
-    }
+    _bindPort();
+    try {
+      FlutterDownloader.registerCallback(inkDownloadCallback);
+    } catch (_) {}
     await _loadExistingTasks();
   }
 
@@ -103,12 +108,10 @@ class DownloadService extends ChangeNotifier {
     if (status == DownloadTaskStatus.complete) {
       item.progress = 100;
       item.error = null;
-      // Best-effort: try to surface the final path.
       unawaited(_refreshTaskPath(item));
     } else if (status == DownloadTaskStatus.failed) {
       item.error ??= 'Download failed';
     }
-
     notifyListeners();
   }
 
@@ -120,14 +123,15 @@ class DownloadService extends ChangeNotifier {
       for (final t in tasks) {
         final existing = _find(t.taskId);
         if (existing != null) {
-          existing.status = t.status;
           existing.progress = t.progress;
-          existing.fileName = t.filename ?? existing.fileName;
+          existing.status = t.status;
           existing.savedDir = t.savedDir;
+          if (t.filename != null && t.filename!.isNotEmpty) {
+            existing.fileName = t.filename!;
+          }
           continue;
         }
 
-        // Only keep recent / interesting tasks in the UI list.
         if (t.status == DownloadTaskStatus.complete ||
             t.status == DownloadTaskStatus.running ||
             t.status == DownloadTaskStatus.enqueued ||
@@ -143,7 +147,6 @@ class DownloadService extends ChangeNotifier {
           ));
         }
       }
-      // Newest first
       _items.sort((a, b) => b.taskId.compareTo(a.taskId));
       notifyListeners();
     } catch (e) {
@@ -162,6 +165,7 @@ class DownloadService extends ChangeNotifier {
         if (t.filename != null && t.filename!.isNotEmpty) {
           item.fileName = t.filename!;
         }
+        notifyListeners();
       }
     } catch (_) {}
   }
@@ -200,80 +204,85 @@ class DownloadService extends ChangeNotifier {
 
   Future<void> _ensurePermissions({bool forApk = false}) async {
     if (!Platform.isAndroid) return;
+
+    // Notifications (Android 13+)
     try {
-      if (!(await Permission.notification.isGranted)) {
-        await Permission.notification.request();
-      }
+      final n = await Permission.notification.status;
+      if (!n.isGranted) await Permission.notification.request();
     } catch (_) {}
+
+    // Storage — try several permission types depending on OS version
     try {
-      if (await Permission.storage.isDenied) await Permission.storage.request();
+      final s = await Permission.storage.status;
+      if (!s.isGranted) await Permission.storage.request();
     } catch (_) {}
-    // Android 11+ : needed to write into public Download folder on some devices
+
     try {
-      if (await Permission.manageExternalStorage.isDenied) {
+      // Photos / videos / audio on Android 13+
+      await Permission.photos.request();
+      await Permission.videos.request();
+      await Permission.audio.request();
+    } catch (_) {}
+
+    // Optional "all files" — helps writing to public Download/
+    try {
+      final m = await Permission.manageExternalStorage.status;
+      if (!m.isGranted) {
+        // Don't block if user denies — we have app-private fallback
         await Permission.manageExternalStorage.request();
       }
     } catch (_) {}
+
     if (forApk) {
       try {
-        if (!(await Permission.requestInstallPackages.isGranted)) {
-          await Permission.requestInstallPackages.request();
-        }
+        final i = await Permission.requestInstallPackages.status;
+        if (!i.isGranted) await Permission.requestInstallPackages.request();
       } catch (_) {}
     }
   }
 
-  /// Prefer public Downloads; fall back to app external storage so downloads
-  /// never hard-fail when MANAGE_EXTERNAL_STORAGE is denied (Android 11+).
+  /// Always returns a writable directory.
+  /// Prefer public Downloads; fall back to app external / documents.
   Future<String> _saveDir() async {
-    final candidates = <String>[
+    // 1) Public Downloads (visible in system Files app)
+    for (final path in const [
       '/storage/emulated/0/Download',
       '/storage/emulated/0/Downloads',
       '/sdcard/Download',
       '/sdcard/Downloads',
-    ];
-    for (final path in candidates) {
+    ]) {
       try {
         final dir = Directory(path);
         if (!await dir.exists()) await dir.create(recursive: true);
         final probe = File('${dir.path}/.ink_write_test');
         await probe.writeAsString('ok', flush: true);
         await probe.delete();
-        debugPrint('INK downloads → public: $path');
+        debugPrint('INK dl dir (public): $path');
         return dir.path;
       } catch (e) {
         debugPrint('public dir fail $path: $e');
       }
     }
 
-    // Fallback 1: app-specific external storage (no special permission on API 29+)
+    // 2) App-specific external storage (works without special permission on API 29+)
     try {
       final ext = await getExternalStorageDirectory();
       if (ext != null) {
         final dir = Directory('${ext.path}/Download');
         if (!await dir.exists()) await dir.create(recursive: true);
-        debugPrint('INK downloads → app external: ${dir.path}');
+        debugPrint('INK dl dir (app external): ${dir.path}');
         return dir.path;
       }
     } catch (e) {
-      debugPrint('getExternalStorageDirectory fail: $e');
+      debugPrint('getExternalStorageDirectory: $e');
     }
 
-    // Fallback 2: application documents
-    try {
-      final docs = await getApplicationDocumentsDirectory();
-      final dir = Directory('${docs.path}/Download');
-      if (!await dir.exists()) await dir.create(recursive: true);
-      debugPrint('INK downloads → app docs: ${dir.path}');
-      return dir.path;
-    } catch (e) {
-      debugPrint('getApplicationDocumentsDirectory fail: $e');
-    }
-
-    throw StateError(
-      'Cannot create a writable download folder. '
-      'Grant storage / "All files access" permission and try again.',
-    );
+    // 3) Application documents
+    final docs = await getApplicationDocumentsDirectory();
+    final dir = Directory('${docs.path}/Download');
+    if (!await dir.exists()) await dir.create(recursive: true);
+    debugPrint('INK dl dir (docs): ${dir.path}');
+    return dir.path;
   }
 
   String _safeFileName(String raw) {
@@ -312,15 +321,22 @@ class DownloadService extends ChangeNotifier {
   }) async {
     await initialize();
 
+    if (url.isEmpty ||
+        url.startsWith('blob:') ||
+        url.startsWith('data:') ||
+        url.startsWith('about:')) {
+      debugPrint('enqueue: unsupported url scheme: $url');
+      return null;
+    }
+
     var name = _safeFileName(
       fileName ??
           () {
             try {
-              return Uri.parse(url).pathSegments.lastWhere(
-                    (s) => s.isNotEmpty,
-                    orElse: () =>
-                        'download_${DateTime.now().millisecondsSinceEpoch}',
-                  );
+              final segs = Uri.parse(url).pathSegments;
+              return segs.isNotEmpty
+                  ? segs.last
+                  : 'download_${DateTime.now().millisecondsSinceEpoch}';
             } catch (_) {
               return 'download_${DateTime.now().millisecondsSinceEpoch}';
             }
@@ -335,19 +351,15 @@ class DownloadService extends ChangeNotifier {
 
     await _ensurePermissions(forApk: name.toLowerCase().endsWith('.apk'));
 
-    String savedDir;
-    try {
-      savedDir = await _saveDir();
-    } catch (e) {
-      debugPrint('saveDir failed: $e');
-      return null;
-    }
+    final savedDir = await _saveDir();
     name = await _uniqueName(savedDir, name);
 
-    // Public path if under /storage/emulated or /sdcard
     final isPublic = savedDir.contains('/storage/emulated') ||
-        savedDir.contains('/sdcard/');
+        savedDir.startsWith('/sdcard');
 
+    debugPrint('INK enqueue url=$url name=$name dir=$savedDir public=$isPublic');
+
+    // Attempt 1
     try {
       final taskId = await FlutterDownloader.enqueue(
         url: url,
@@ -357,78 +369,54 @@ class DownloadService extends ChangeNotifier {
         openFileFromNotification: true,
         allowCellular: true,
         saveInPublicStorage: isPublic,
+        requiresStorageNotLow: false,
       );
-
-      if (taskId == null) {
-        debugPrint('FlutterDownloader.enqueue returned null, retrying private…');
-        // Retry without public storage flag
-        final taskId2 = await FlutterDownloader.enqueue(
-          url: url,
-          savedDir: savedDir,
-          fileName: name,
-          showNotification: showNotification,
-          openFileFromNotification: true,
-          allowCellular: true,
-          saveInPublicStorage: false,
-        );
-        if (taskId2 == null) {
-          debugPrint('FlutterDownloader.enqueue returned null twice');
-          return null;
-        }
-        final item2 = DownloadItem(
-          taskId: taskId2,
-          url: url,
-          fileName: name,
-          savedDir: savedDir,
-          progress: 0,
-          status: DownloadTaskStatus.enqueued,
-        );
-        _items.insert(0, item2);
-        notifyListeners();
-        return taskId2;
+      if (taskId != null) {
+        _addItem(taskId, url, name, savedDir);
+        return taskId;
       }
+      debugPrint('enqueue returned null (public=$isPublic)');
+    } catch (e, st) {
+      debugPrint('enqueue error: $e\n$st');
+    }
 
-      final item = DownloadItem(
+    // Attempt 2 — force private storage
+    try {
+      final taskId = await FlutterDownloader.enqueue(
+        url: url,
+        savedDir: savedDir,
+        fileName: name,
+        showNotification: showNotification,
+        openFileFromNotification: true,
+        allowCellular: true,
+        saveInPublicStorage: false,
+        requiresStorageNotLow: false,
+      );
+      if (taskId != null) {
+        _addItem(taskId, url, name, savedDir);
+        return taskId;
+      }
+      debugPrint('enqueue returned null (private)');
+    } catch (e, st) {
+      debugPrint('enqueue private error: $e\n$st');
+    }
+
+    return null;
+  }
+
+  void _addItem(String taskId, String url, String name, String savedDir) {
+    _items.insert(
+      0,
+      DownloadItem(
         taskId: taskId,
         url: url,
         fileName: name,
         savedDir: savedDir,
         progress: 0,
         status: DownloadTaskStatus.enqueued,
-      );
-      _items.insert(0, item);
-      notifyListeners();
-      return taskId;
-    } catch (e, st) {
-      debugPrint('enqueue failed: $e\n$st');
-      // Last attempt: private storage only
-      try {
-        final taskId = await FlutterDownloader.enqueue(
-          url: url,
-          savedDir: savedDir,
-          fileName: name,
-          showNotification: showNotification,
-          openFileFromNotification: true,
-          allowCellular: true,
-          saveInPublicStorage: false,
-        );
-        if (taskId == null) return null;
-        final item = DownloadItem(
-          taskId: taskId,
-          url: url,
-          fileName: name,
-          savedDir: savedDir,
-          progress: 0,
-          status: DownloadTaskStatus.enqueued,
-        );
-        _items.insert(0, item);
-        notifyListeners();
-        return taskId;
-      } catch (e2, st2) {
-        debugPrint('enqueue retry failed: $e2\n$st2');
-        return null;
-      }
-    }
+      ),
+    );
+    notifyListeners();
   }
 
   Future<void> pause(String taskId) async {
@@ -445,36 +433,25 @@ class DownloadService extends ChangeNotifier {
   }
 
   Future<void> resume(String taskId) async {
-    final item = _find(taskId);
-    if (item == null) return;
-
     try {
-      if (item.status == DownloadTaskStatus.paused) {
-        final newId = await FlutterDownloader.resume(taskId: taskId);
-        if (newId != null && newId != taskId) {
-          // Plugin sometimes returns a new task id on resume.
+      final newId = await FlutterDownloader.resume(taskId: taskId);
+      if (newId != null) {
+        final item = _find(taskId);
+        if (item != null) {
           item.taskId = newId;
+          item.status = DownloadTaskStatus.running;
+          notifyListeners();
         }
-        item.status = DownloadTaskStatus.running;
-        notifyListeners();
-        return;
       }
-
-      // Failed / canceled → re-enqueue
-      if (item.status == DownloadTaskStatus.failed ||
-          item.status == DownloadTaskStatus.canceled) {
+    } catch (e) {
+      debugPrint('resume error: $e');
+      final item = _find(taskId);
+      if (item != null) {
         final url = item.url;
         final name = item.fileName;
         await remove(taskId, deleteFile: false);
         await enqueue(url: url, fileName: name);
       }
-    } catch (e) {
-      debugPrint('resume error: $e');
-      // Fallback: re-enqueue
-      final url = item.url;
-      final name = item.fileName;
-      await remove(taskId, deleteFile: false);
-      await enqueue(url: url, fileName: name);
     }
   }
 
@@ -514,7 +491,6 @@ class DownloadService extends ChangeNotifier {
   Future<OpenResult> openFile(DownloadItem item) async {
     final path = item.filePath;
     if (path == null || !File(path).existsSync()) {
-      // Try asking the plugin for the path
       try {
         await FlutterDownloader.open(taskId: item.taskId);
         return OpenResult(type: ResultType.done, message: 'opened');
