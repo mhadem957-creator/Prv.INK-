@@ -3,10 +3,12 @@ name: Build Android APK
 on:
   push:
     branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
   workflow_dispatch: {}
 
 env:
-  FLUTTER_VERSION: "3.24.5"
+  FLUTTER_VERSION: "3.27.4"
 
 jobs:
   build:
@@ -36,8 +38,9 @@ jobs:
           path: |
             \~/.gradle/caches
             \~/.gradle/wrapper
-          key: gradle-\( {{ runner.os }}- \){{ env.FLUTTER_VERSION }}
+          key: gradle-\( {{ runner.os }}- \){{ env.FLUTTER_VERSION }}-${{ hashFiles('**/pubspec.lock') }}
           restore-keys: |
+            gradle-\( {{ runner.os }}- \){{ env.FLUTTER_VERSION }}-
             gradle-${{ runner.os }}-
 
       # This repo doesn't commit the android/ platform folder (it contains a
@@ -76,3 +79,9 @@ jobs:
           path: build/app/outputs/flutter-apk/*.apk
           if-no-files-found: error
           retention-days: 30
+
+      - name: Summary
+        run: |
+          echo "### INK APK build complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          ls -lh build/app/outputs/flutter-apk/*.apk >> $GITHUB_STEP_SUMMARY || true
