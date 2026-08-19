@@ -226,11 +226,13 @@ class _BrowserScreenState extends State<BrowserScreen> {
       );
       if (confirmed == true) {
         final taskId = await downloadService.enqueue(url: url);
-        if (mounted && taskId != null) {
+        if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
               content: Text(
-                'Download started: ${Uri.parse(url).pathSegments.last}',
+                taskId != null
+                    ? 'Download started: ${Uri.parse(url).pathSegments.isNotEmpty ? Uri.parse(url).pathSegments.last : "file"}'
+                    : 'Download failed — check storage permission',
               ),
               action: SnackBarAction(
                 label: 'VIEW',
