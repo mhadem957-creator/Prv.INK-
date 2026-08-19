@@ -39,7 +39,8 @@ void main() {
     test('redirects search terms to SearXNG', () {
       final url = service.resolveInput('open source browsers');
       expect(url.startsWith('https://searx.example/search?q=open+source+browsers'), isTrue);
-      expect(url.contains('categories=general'), isTrue);
+      expect(url.contains('engines='), isTrue);
+      expect(url.contains('safesearch='), isTrue);
     });
   });
 }
