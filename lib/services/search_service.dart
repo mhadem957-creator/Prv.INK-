@@ -9,22 +9,8 @@ class SearchService {
   final int safeSearch;
 
   /// Engines covering virtually every kind of public web content.
-  static const String preferredEngines = [
-    'google',
-    'duckduckgo',
-    'brave',
-    'bing',
-    'qwant',
-    'startpage',
-    'wikipedia',
-    'wikidata',
-    'youtube',
-    'reddit',
-    'github',
-    'stackoverflow',
-    'apple app store',
-    'google play store',
-  ].join(',');
+  static const String preferredEngines =
+      'google,duckduckgo,brave,bing,qwant,startpage,wikipedia,wikidata,youtube,reddit,github,stackoverflow,apple app store,google play store';
 
   /// DuckDuckGo-style bangs → specialized destinations.
   static const Map<String, String> bangs = {
