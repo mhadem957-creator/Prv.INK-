@@ -11,8 +11,8 @@ Unlike mainstream browsers that monetize your attention, INK is designed so **yo
 | Feature | Google Chrome | INK |
 |---------|---------------|-----|
 | Default search | Google (tracks you) | SearXNG (no tracking) |
-| Built-in ad blocking | Limited / paid | Strong, on by default |
-| Tracker blocking | Partial | Dedicated list, on by default |
+| Built-in ad blocking | Limited / paid | EasyList (~47k domains), on by default |
+| Tracker blocking | Partial | EasyPrivacy (~47k domains), on by default |
 | Telemetry | Heavy | None |
 | Account requirement | Encouraged | Never |
 | Open source | Partial | Fully open |
@@ -21,7 +21,7 @@ Unlike mainstream browsers that monetize your attention, INK is designed so **yo
 ## Features
 
 - **SearXNG search** — type anything that isn’t a URL and it goes to a privacy-respecting metasearch engine
-- **Ad & tracker blocking** — human-auditable domain lists you can edit
+- **Ad & tracker blocking** — EasyList + EasyPrivacy domain lists (≈95k rules), human-auditable and editable
 - **Secure DNS helpers** — DoH lookup tool + one-tap jump to Android Private DNS
 - **Incognito / clear-on-exit**
 - **Biometric app lock** (optional)
@@ -98,12 +98,15 @@ Recommended hosts: `1.1.1.1`, `dns.quad9.net`, `dns.adguard-dns.com`
 
 ## Ad & tracker blocking
 
-Blocking uses `flutter_inappwebview` ContentBlockers driven by two plain-text lists:
+Blocking uses `flutter_inappwebview` ContentBlockers driven by two plain-text domain lists:
 
-- `assets/adblock/ad_domains.txt`
-- `assets/adblock/tracker_domains.txt`
+- `assets/adblock/ad_domains.txt` — **EasyList** network domains (`||domain^` rules) + original curated list (~47k entries)
+- `assets/adblock/tracker_domains.txt` — **EasyPrivacy** network domains + original curated list (~47k entries)
 
-Add one domain per line. Toggle each list independently in Settings. The lists shipped with INK are intentionally readable and effective against the majority of commercial ads and analytics.
+Sources: [EasyList](https://easylist.to) / [EasyPrivacy](https://easylist.to/easylist/easyprivacy.txt).  
+Only pure network domain rules are extracted (cosmetic filters `##` are not supported by WebView ContentBlockers).
+
+Add one domain per line. Toggle each list independently in Settings. You can still edit the files freely — they remain human-readable.
 
 ## Philosophy
 
