@@ -1,114 +1,28 @@
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show SystemNavigator;
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:provider/provider.dart';
 
+import '../browser/ink_webview.dart';
+import '../browser/webview_privacy.dart';
 import '../models/browser_settings.dart';
 import '../models/browser_tab.dart';
-import '../services/adblock_service.dart';
 import '../services/download_service.dart';
 import '../services/history_service.dart';
 import '../services/search_service.dart';
 import '../services/storage_service.dart';
 import '../theme/manga_theme.dart';
-import '../widgets/manga_bottom_bar.dart';
 import '../widgets/ink_home_page.dart';
+import '../widgets/manga_bottom_bar.dart';
 import '../widgets/manga_url_bar.dart';
 import 'downloads_screen.dart';
 import 'history_screen.dart';
 import 'settings_screen.dart';
 import 'tabs_screen.dart';
 
-const String _searxCloakJs = r"""
-(function(){
-  try {
-    var h = location.hostname || '';
-    if (h.indexOf('searx') === -1 && location.href.indexOf('/search') === -1) return;
-    var css = 'body,html{background:#F6F5F0!important;color:#121212!important}'
-      + '.title,.navbar-brand,#main-logo,.logo,footer,#footer,.footer,.powered-by,'
-      + 'img[alt*="SearX"],img[src*="searx"],header .title,.instance-name'
-      + '{display:none!important;height:0!important;overflow:hidden!important}'
-      + 'nav.navbar,.searx-navbar,header{background:#F6F5F0!important;border-bottom:3px solid #121212!important;box-shadow:none!important}'
-      + 'input[type=text],input[type=search],#q{border:3px solid #121212!important;border-radius:0!important;background:#fff!important;box-shadow:3px 3px 0 #121212!important}'
-      + 'button,.btn,input[type=submit]{background:#E60012!important;color:#F6F5F0!important;border:3px solid #121212!important;border-radius:0!important;font-weight:800!important}'
-      + '#urls article,.result{border:2px solid #121212!important;background:#fff!important;box-shadow:3px 3px 0 #121212!important;margin-bottom:10px!important;padding:10px!important}'
-      + 'a{color:#E60012!important}h3,h4{color:#121212!important;font-weight:900!important}';
-    var s=document.createElement('style'); s.textContent=css;
-    (document.documentElement||document.head).appendChild(s);
-  } catch(e) {}
-})();
-""";
-
-const String _desktopUserAgent =
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
-    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-
-/// Blocks WebRTC so pages cannot read the device's local/public IP via STUN.
-const String _webrtcBlockJs = r"""
-(function(){
-  try {
-    var noop = function(){};
-    var fake = function(){ throw new Error('WebRTC disabled by INK'); };
-    window.RTCPeerConnection = fake;
-    window.webkitRTCPeerConnection = fake;
-    window.mozRTCPeerConnection = fake;
-    window.RTCSessionDescription = noop;
-    window.RTCIceCandidate = noop;
-    if (navigator.mediaDevices) {
-      try {
-        navigator.mediaDevices.getUserMedia = function(){
-          return Promise.reject(new Error('Blocked by INK'));
-        };
-        navigator.mediaDevices.enumerateDevices = function(){
-          return Promise.resolve([]);
-        };
-      } catch(e){}
-    }
-  } catch(e){}
-})();
-""";
-
-/// Light anti-fingerprint: limit common high-entropy APIs used for tracking.
-const String _fingerprintGuardJs = r"""
-(function(){
-  try {
-    // Stabilize canvas fingerprint noise without breaking pages.
-    var toDataURL = HTMLCanvasElement.prototype.toDataURL;
-    HTMLCanvasElement.prototype.toDataURL = function(){
-      try {
-        var ctx = this.getContext('2d');
-        if (ctx) {
-          var s = ctx.fillStyle;
-          ctx.fillStyle = 'rgba(0,0,0,0.01)';
-          ctx.fillRect(0,0,1,1);
-          ctx.fillStyle = s;
-        }
-      } catch(e){}
-      return toDataURL.apply(this, arguments);
-    };
-    // Reduce audio fingerprint surface.
-    if (window.AudioContext || window.webkitAudioContext) {
-      var AC = window.AudioContext || window.webkitAudioContext;
-      var orig = AC.prototype.createAnalyser;
-      AC.prototype.createAnalyser = function(){
-        var a = orig.apply(this, arguments);
-        try {
-          var getFloat = a.getFloatFrequencyData.bind(a);
-          a.getFloatFrequencyData = function(arr){
-            getFloat(arr);
-            for (var i=0;i<arr.length;i+=10){ arr[i] += (Math.random()*0.01); }
-          };
-        } catch(e){}
-        return a;
-      };
-    }
-  } catch(e){}
-})();
-""";
-
-/// Main browser screen combining InAppWebView, AdBlock, DownloadService,
-/// MangaUrlBar and MangaBottomBar.
+/// Main browser screen: tab management + chrome UI + coordination.
+///
+/// Heavy WebView logic lives in [InkWebView] and [WebViewPrivacy].
 class BrowserScreen extends StatefulWidget {
   const BrowserScreen({super.key});
 
@@ -127,7 +41,9 @@ class _BrowserScreenState extends State<BrowserScreen> {
   /// Address bar + progress chrome visibility (hide on scroll down).
   bool _chromeVisible = true;
   int _lastScrollY = 0;
-  static const double _scrollHideThreshold = 10;
+
+  /// Double-back-to-exit tracking for the system back button.
+  DateTime? _lastBackPress;
 
   BrowserTab get _currentTab => _tabs[_currentIndex];
 
@@ -139,7 +55,6 @@ class _BrowserScreenState extends State<BrowserScreen> {
   @override
   void initState() {
     super.initState();
-    // Initialize download service early.
     DownloadService.instance.initialize();
     HistoryService.instance.load();
     _urlFocusNode.addListener(_onUrlFocusChange);
@@ -159,8 +74,7 @@ class _BrowserScreenState extends State<BrowserScreen> {
     }
   }
 
-  void _handleWebScroll(int index, int x, int y) {
-    if (index != _currentIndex) return;
+  void _handleWebScroll(int x, int y) {
     // Always show near the top, or while typing a URL.
     if (y <= 48 || _urlFocusNode.hasFocus) {
       if (!_chromeVisible) {
@@ -170,7 +84,6 @@ class _BrowserScreenState extends State<BrowserScreen> {
       return;
     }
     final dy = y - _lastScrollY;
-    // Require a deliberate swipe before toggling (reduces flicker + lag).
     if (dy > 24 && _chromeVisible) {
       _safeSetState(() => _chromeVisible = false);
       _lastScrollY = y;
@@ -178,15 +91,12 @@ class _BrowserScreenState extends State<BrowserScreen> {
       _safeSetState(() => _chromeVisible = true);
       _lastScrollY = y;
     } else if (dy.abs() > 80) {
-      // Keep reference from drifting too far without toggling.
       _lastScrollY = y;
     }
   }
 
   @override
   void dispose() {
-    // Clear on exit if enabled. Avoid context.read after unmount —
-    // use a best-effort try and ignore if the element is already defunct.
     try {
       if (mounted) {
         final settings = context.read<BrowserSettings>();
@@ -200,6 +110,10 @@ class _BrowserScreenState extends State<BrowserScreen> {
     _urlFocusNode.dispose();
     super.dispose();
   }
+
+  // ---------------------------------------------------------------------------
+  // Tab management
+  // ---------------------------------------------------------------------------
 
   void _openNewTab({String? url}) {
     final settings = context.read<BrowserSettings>();
@@ -217,7 +131,6 @@ class _BrowserScreenState extends State<BrowserScreen> {
   }
 
   Future<void> _closeTab(int index) async {
-    final settings = context.read<BrowserSettings>();
     if (_tabs.length == 1) {
       setState(() {
         _tabs[0] = BrowserTab(
@@ -235,31 +148,28 @@ class _BrowserScreenState extends State<BrowserScreen> {
       _tabs.removeAt(index);
       if (_currentIndex >= _tabs.length) {
         _currentIndex = _tabs.length - 1;
+      } else if (index < _currentIndex) {
+        _currentIndex--;
       }
-      _urlController.text = _currentTab.url;
+      _urlController.text = WebViewPrivacy.displayUrl(_currentTab.url);
+      _chromeVisible = true;
     });
   }
 
   void _switchTab(int index) {
+    if (index < 0 || index >= _tabs.length) return;
     setState(() {
       _currentIndex = index;
-      _urlController.text = _tabs[index].url;
-      _isLoading = false;
-      _progress = 0;
+      _urlController.text = WebViewPrivacy.displayUrl(_currentTab.url);
       _chromeVisible = true;
       _lastScrollY = 0;
+      _isLoading = false;
     });
   }
 
-  bool _isHomeUrl(String? url) {
-    if (url == null || url.isEmpty) return false;
-    final s = url.trim().toLowerCase();
-    return s == 'about:ink' ||
-        s == 'about:home' ||
-        s == 'ink://home' ||
-        s.startsWith('https://ink.local') ||
-        s.startsWith('http://ink.local');
-  }
+  // ---------------------------------------------------------------------------
+  // Navigation / URL handling
+  // ---------------------------------------------------------------------------
 
   Future<void> _handleSubmitted(String input) async {
     final trimmed = input.trim();
@@ -270,7 +180,7 @@ class _BrowserScreenState extends State<BrowserScreen> {
       setState(() {
         _currentTab.url = 'about:ink';
         _currentTab.title = 'Ink';
-        _currentTab.controller = null; // drop WebView; native home is shown
+        _currentTab.controller = null;
         _urlController.text = '';
         _isLoading = false;
         _chromeVisible = true;
@@ -280,7 +190,10 @@ class _BrowserScreenState extends State<BrowserScreen> {
     }
 
     final settings = context.read<BrowserSettings>();
-    final searchService = SearchService(settings.searxngUrl, safeSearch: settings.safeSearch);
+    final searchService = SearchService(
+      settings.searxngUrl,
+      safeSearch: settings.safeSearch,
+    );
     var resolved = searchService.resolveInput(trimmed);
     if (resolved.isEmpty) return;
     if (settings.forceHttps && resolved.startsWith('http://')) {
@@ -296,129 +209,6 @@ class _BrowserScreenState extends State<BrowserScreen> {
     }
   }
 
-
-  bool _isSearxUrl(String? url) {
-    if (url == null || url.isEmpty) return false;
-    final u = url.toLowerCase();
-    return u.contains('searx') || (u.contains('/search?') && u.contains('q='));
-  }
-
-  /// Hide SearXNG branding and restyle results.
-  Future<void> _cloakSearx(InAppWebViewController controller) async {
-    const js = r"""
-(function() {
-  if (window.__inkCloak) return;
-  window.__inkCloak = true;
-  var css = `
-    body, html { background: #F6F5F0 !important; color: #121212 !important; }
-    .title, a.navbar-brand, .navbar-brand, #main-logo, .logo,
-    footer, #footer, .footer, .powered-by,
-    img[alt*="SearX"], img[src*="searx"],
-    header .title, .instance-name {
-      display: none !important;
-      visibility: hidden !important;
-      height: 0 !important;
-      overflow: hidden !important;
-    }
-    nav.navbar, .searx-navbar, header {
-      background: #F6F5F0 !important;
-      border-bottom: 3px solid #121212 !important;
-      box-shadow: none !important;
-    }
-    input[type="text"], input[type="search"], #q {
-      border: 3px solid #121212 !important;
-      border-radius: 0 !important;
-      background: #fff !important;
-      box-shadow: 3px 3px 0 #121212 !important;
-      color: #121212 !important;
-      font-weight: 600 !important;
-    }
-    button, .btn, input[type="submit"] {
-      background: #E60012 !important;
-      color: #F6F5F0 !important;
-      border: 3px solid #121212 !important;
-      border-radius: 0 !important;
-      box-shadow: 3px 3px 0 #121212 !important;
-      font-weight: 800 !important;
-    }
-    #urls article, .result, #urls .result {
-      border: 2px solid #121212 !important;
-      border-radius: 0 !important;
-      background: #fff !important;
-      box-shadow: 3px 3px 0 #121212 !important;
-      margin-bottom: 12px !important;
-      padding: 12px !important;
-    }
-    a { color: #E60012 !important; }
-    h3, h4 { color: #121212 !important; font-weight: 900 !important; }
-  `;
-  var s = document.createElement('style');
-  s.id = 'ink-cloak';
-  s.textContent = css;
-  (document.head || document.documentElement).appendChild(s);
-  try {
-    document.title = (document.title || '').replace(/SearXNG/gi, 'Ink').replace(/SearxNG/gi, 'Ink').replace(/Searx/gi, 'Ink');
-  } catch (e) {}
-})();
-""";
-    try {
-      await controller.evaluateJavascript(source: js);
-    } catch (_) {}
-  }
-
-  String _displayUrl(String url) {
-    if (url == 'about:ink' ||
-        url == 'about:home' ||
-        url.startsWith('https://ink.local')) {
-      return '';
-    }
-    if (_isSearxUrl(url)) {
-      try {
-        final q = Uri.parse(url).queryParameters['q'];
-        if (q != null && q.isNotEmpty) return q;
-      } catch (_) {}
-      return 'Search';
-    }
-    return url;
-  }
-
-
-  Future<void> _injectPrivacyGuards(InAppWebViewController controller) async {
-    final settings = context.read<BrowserSettings>();
-    try {
-      if (settings.blockWebRtc) {
-        await controller.evaluateJavascript(source: _webrtcBlockJs);
-      }
-      if (settings.fingerprintGuard) {
-        await controller.evaluateJavascript(source: _fingerprintGuardJs);
-      }
-    } catch (_) {}
-  }
-
-  Future<void> _injectForceDark(InAppWebViewController controller) async {
-    const js = r"""
-(function(){
-  if (window.__inkDark) return; window.__inkDark = true;
-  var s=document.createElement('style');
-  s.textContent='html,body{background:#121212!important;color:#E8E6DF!important}a{color:#E60012!important}img,video{opacity:.92}';
-  (document.head||document.documentElement).appendChild(s);
-})();
-""";
-    try { await controller.evaluateJavascript(source: js); } catch (_) {}
-  }
-
-  Future<void> _applyContentBlockers(InAppWebViewController controller) async {
-    final settings = context.read<BrowserSettings>();
-    final blockers = await AdBlockService.instance.buildContentBlockers(
-      blockAds: settings.adBlockEnabled,
-      blockTrackers: settings.trackerBlockEnabled,
-    );
-    await controller.setSettings(
-      settings: InAppWebViewSettings(contentBlockers: blockers),
-    );
-  }
-
-  /// Intercept navigation / resource loads that look like direct file downloads.
   Future<NavigationActionPolicy?> _shouldOverrideUrlLoading(
     InAppWebViewController controller,
     NavigationAction action,
@@ -428,14 +218,20 @@ class _BrowserScreenState extends State<BrowserScreen> {
 
     final downloadService = DownloadService.instance;
     if (downloadService.isDownloadableUrl(url)) {
-      // Ask user before starting the download.
-      final confirmed = await _showDownloadConfirmDialog(url);
+      final confirmed = await showDownloadConfirmDialog(
+        context,
+        Uri.parse(url).pathSegments.isNotEmpty
+            ? Uri.parse(url).pathSegments.last
+            : url,
+      );
       if (confirmed == true) {
         final taskId = await downloadService.enqueue(url: url);
         if (mounted && taskId != null) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text('Download started: ${Uri.parse(url).pathSegments.last}'),
+              content: Text(
+                'Download started: ${Uri.parse(url).pathSegments.last}',
+              ),
               action: SnackBarAction(
                 label: 'VIEW',
                 textColor: MangaTheme.crimson,
@@ -450,36 +246,209 @@ class _BrowserScreenState extends State<BrowserScreen> {
     return NavigationActionPolicy.ALLOW;
   }
 
-  Future<bool?> _showDownloadConfirmDialog(String url) {
-    final name = Uri.parse(url).pathSegments.isNotEmpty
-        ? Uri.parse(url).pathSegments.last
-        : url;
-    return showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: MangaTheme.paperOf(context),
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.zero,
-          side: BorderSide(color: MangaTheme.inkOf(context), width: 4),
-        ),
-        title: const Text(
-          'DOWNLOAD?',
-          style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 1),
-        ),
-        content: Text(
-          name,
-          style: const TextStyle(fontWeight: FontWeight.w600),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('CANCEL', style: TextStyle(fontWeight: FontWeight.w800)),
+  Future<void> _onDownloadRequest(String url, String? suggested) async {
+    final displayName = (suggested != null && suggested.isNotEmpty)
+        ? suggested
+        : (Uri.tryParse(url)?.pathSegments.isNotEmpty == true
+            ? Uri.parse(url).pathSegments.last
+            : 'file');
+    final confirmed = await showDownloadConfirmDialog(context, displayName);
+    if (confirmed == true) {
+      final taskId = await DownloadService.instance.enqueue(
+        url: url,
+        fileName: suggested,
+      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              taskId != null
+                  ? 'Download started: $displayName'
+                  : 'Download failed to start',
+            ),
+            action: SnackBarAction(
+              label: 'VIEW',
+              textColor: MangaTheme.crimson,
+              onPressed: _showDownloadsScreen,
+            ),
           ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('DOWNLOAD'),
-          ),
-        ],
+        );
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Chrome actions
+  // ---------------------------------------------------------------------------
+
+  Future<void> _goBack() async {
+    final controller = _currentTab.controller;
+    if (controller != null && await controller.canGoBack()) {
+      await controller.goBack();
+    }
+  }
+
+  Future<void> _goForward() async {
+    final controller = _currentTab.controller;
+    if (controller != null && await controller.canGoForward()) {
+      await controller.goForward();
+    }
+  }
+
+  Future<void> _reloadOrStop() async {
+    final controller = _currentTab.controller;
+    if (controller == null) return;
+    if (_isLoading) {
+      await controller.stopLoading();
+    } else {
+      await controller.reload();
+    }
+  }
+
+  Future<void> _goHome() async {
+    final settings = context.read<BrowserSettings>();
+    await _handleSubmitted(settings.homePage);
+  }
+
+  /// Phone system back button / gesture:
+  /// 1) WebView history back if possible
+  /// 2) If not on home page → go home
+  /// 3) If multiple tabs → close current tab
+  /// 4) Double-press back within 2s → exit app
+  Future<void> _onSystemBack() async {
+    final controller = _currentTab.controller;
+    if (controller != null) {
+      try {
+        if (await controller.canGoBack()) {
+          await controller.goBack();
+          return;
+        }
+      } catch (_) {}
+    }
+
+    final url = _currentTab.url.trim().toLowerCase();
+    final onHome = url.isEmpty ||
+        url == 'about:ink' ||
+        url == 'about:blank' ||
+        url.startsWith('ink://');
+    if (!onHome) {
+      _handleSubmitted('about:ink');
+      return;
+    }
+
+    if (_tabs.length > 1) {
+      await _closeTab(_currentIndex);
+      return;
+    }
+
+    final now = DateTime.now();
+    if (_lastBackPress != null &&
+        now.difference(_lastBackPress!) < const Duration(seconds: 2)) {
+      SystemNavigator.pop();
+      return;
+    }
+    _lastBackPress = now;
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('اضغط مرة أخرى للخروج'),
+        duration: Duration(seconds: 2),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Navigation to secondary screens
+  // ---------------------------------------------------------------------------
+
+  void _showTabsScreen() {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => TabsScreen(
+          tabs: _tabs,
+          currentIndex: _currentIndex,
+          onSelect: (i) {
+            Navigator.pop(context);
+            _switchTab(i);
+          },
+          onClose: _closeTab,
+          onNewTab: () {
+            Navigator.pop(context);
+            _openNewTab();
+          },
+        ),
+      ),
+    );
+  }
+
+  void _showSettingsScreen() {
+    Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const SettingsScreen()),
+    );
+  }
+
+  void _showHistoryScreen() {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => HistoryScreen(
+          onOpenUrl: (url) {
+            _handleSubmitted(url);
+          },
+        ),
+      ),
+    );
+  }
+
+  void _showDownloadsScreen() {
+    Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const DownloadsScreen()),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Build
+  // ---------------------------------------------------------------------------
+
+  Widget _buildTab(int index) {
+    final tab = _tabs[index];
+    if (WebViewPrivacy.isHomeUrl(tab.url)) {
+      return KeyedSubtree(
+        key: ValueKey('home-${tab.id}'),
+        child: InkHomePage(
+          onSearch: (q) {
+            if (index == _currentIndex) _handleSubmitted(q);
+          },
+          onOpenUrl: (url) {
+            if (index == _currentIndex) _handleSubmitted(url);
+          },
+        ),
+      );
+    }
+    return KeyedSubtree(
+      key: ValueKey(tab.id),
+      child: InkWebView(
+        tab: tab,
+        isActive: index == _currentIndex,
+        onUrlChanged: (url, display) {
+          if (index != _currentIndex) return;
+          _urlController.text = display;
+        },
+        onLoadingChanged: (loading) {
+          if (index != _currentIndex) return;
+          _safeSetState(() => _isLoading = loading);
+        },
+        onProgressChanged: (p) {
+          if (index != _currentIndex) return;
+          _safeSetState(() => _progress = p);
+        },
+        onScrollChanged: (x, y) {
+          if (index != _currentIndex) return;
+          _handleWebScroll(x, y);
+        },
+        onDownloadRequest: _onDownloadRequest,
+        shouldOverrideUrlLoading: _shouldOverrideUrlLoading,
       ),
     );
   }
@@ -503,8 +472,6 @@ class _BrowserScreenState extends State<BrowserScreen> {
       },
       child: Scaffold(
         backgroundColor: MangaTheme.paperOf(context),
-        // WebView stays full-screen — chrome is an overlay so hide/show
-        // never resizes the page (that was the lag source).
         body: Stack(
           children: [
             Positioned.fill(
@@ -608,301 +575,6 @@ class _BrowserScreenState extends State<BrowserScreen> {
           ],
         ),
       ),
-    );
-  }
-
-  Widget _buildTab(int index) {
-    final tab = _tabs[index];
-    if (_isHomeUrl(tab.url)) {
-      return KeyedSubtree(
-        key: ValueKey('home-${tab.id}'),
-        child: InkHomePage(
-          onSearch: (q) {
-            if (index == _currentIndex) _handleSubmitted(q);
-          },
-          onOpenUrl: (url) {
-            if (index == _currentIndex) _handleSubmitted(url);
-          },
-        ),
-      );
-    }
-    return _buildWebViewForTab(index);
-  }
-
-  Widget _buildWebViewForTab(int index) {
-    final tab = _tabs[index];
-    final settings = context.read<BrowserSettings>();
-
-    return KeyedSubtree(
-      key: ValueKey(tab.id),
-      child: InAppWebView(
-        initialUrlRequest: URLRequest(
-          url: WebUri(
-            tab.url.isEmpty || _isHomeUrl(tab.url)
-                ? 'about:blank'
-                : tab.url,
-          ),
-        ),
-        initialSettings: InAppWebViewSettings(
-          javaScriptEnabled: settings.javascriptEnabled,
-          cacheEnabled: true,
-          supportZoom: true,
-          transparentBackground: true,
-          mediaPlaybackRequiresUserGesture: settings.mediaRequiresGesture,
-          userAgent: settings.desktopMode ? _desktopUserAgent : null,
-          useShouldOverrideUrlLoading: true,
-          useOnDownloadStart: true,
-          supportMultipleWindows: !settings.blockPopups,
-          mixedContentMode: MixedContentMode.MIXED_CONTENT_COMPATIBILITY_MODE,
-          useOnLoadResource: false,
-          verticalScrollBarEnabled: true,
-          preferredContentMode: UserPreferredContentMode.MOBILE,
-          allowsInlineMediaPlayback: true,
-          allowsBackForwardNavigationGestures: true,
-          // Stability
-          domStorageEnabled: true,
-          databaseEnabled: true,
-          thirdPartyCookiesEnabled: true,
-          loadWithOverviewMode: true,
-          useWideViewPort: true,
-          builtInZoomControls: true,
-          displayZoomControls: false,
-          safeBrowsingEnabled: false,
-          allowFileAccess: true,
-          allowContentAccess: true,
-          hardwareAcceleration: true,
-        ),
-        onWebViewCreated: (controller) async {
-          tab.controller = controller;
-          try {
-            await controller.addUserScript(
-              userScript: UserScript(
-                source: _searxCloakJs,
-                injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
-              ),
-            );
-          } catch (_) {}
-          await _applyContentBlockers(controller);
-          // Best-effort early privacy guards on the empty document.
-          await _injectPrivacyGuards(controller);
-        },
-        shouldOverrideUrlLoading: _shouldOverrideUrlLoading,
-        onLoadStart: (controller, url) {
-          final u = url?.toString() ?? '';
-          // Never replace the synthetic home URL with about:blank / data:
-          if (u == 'about:blank' || u.startsWith('data:')) {
-            if (index == _currentIndex) {
-              setState(() => _isLoading = true);
-            }
-            return;
-          }
-          if (_isHomeUrl(u) ||
-              tab.url == 'about:ink' ||
-              tab.url == 'about:home') {
-            if (_isHomeUrl(u) || u.startsWith('https://ink.local')) {
-              tab.url = 'about:ink';
-              tab.title = 'Ink';
-            }
-            if (index == _currentIndex) {
-              setState(() {
-                _isLoading = true;
-                _urlController.text = '';
-              });
-            }
-            return;
-          }
-          tab.url = u;
-          if (index != _currentIndex) return;
-          setState(() {
-            _isLoading = true;
-            _urlController.text = _displayUrl(tab.url);
-          });
-        },
-        onLoadStop: (controller, url) async {
-          final u = url?.toString() ?? '';
-          if (u == 'about:blank' ||
-              u.startsWith('data:') ||
-              _isHomeUrl(u) ||
-              tab.url == 'about:ink' ||
-              tab.url == 'about:home') {
-            if (_isHomeUrl(u) ||
-                u.startsWith('https://ink.local') ||
-                tab.url == 'about:ink' ||
-                tab.url == 'about:home') {
-              tab.url = 'about:ink';
-              tab.title = 'Ink';
-            }
-            if (!mounted || index != _currentIndex) return;
-            setState(() {
-              _isLoading = false;
-              _urlController.text = '';
-            });
-            return;
-          }
-          tab.url = u.isNotEmpty ? u : tab.url;
-          tab.title = await controller.getTitle() ?? tab.url;
-          final settings = context.read<BrowserSettings>();
-          if (_isSearxUrl(tab.url) && settings.cloakSearchBranding) {
-            await _cloakSearx(controller);
-            tab.title = 'Ink Search';
-          }
-          await _injectPrivacyGuards(controller);
-          if (settings.forceDarkPages) {
-            await _injectForceDark(controller);
-          }
-          if (!settings.loadImages) {
-            try {
-              await controller.evaluateJavascript(source: r"""
-                (function(){var s=document.createElement('style');s.textContent='img,picture,video{display:none!important}';(document.head||document.documentElement).appendChild(s);})();
-              """);
-            } catch (_) {}
-          }
-          // Record history (skipped when incognito / disabled)
-          await HistoryService.instance.add(
-            url: tab.url,
-            title: tab.title,
-            incognito: settings.incognitoMode || !settings.saveHistory,
-          );
-          if (!mounted || index != _currentIndex) return;
-          setState(() {
-            _isLoading = false;
-            _urlController.text = _displayUrl(tab.url);
-          });
-        },
-        onProgressChanged: (controller, progress) {
-          if (index != _currentIndex) return;
-          setState(() => _progress = progress / 100);
-        },
-        onScrollChanged: (controller, x, y) {
-          _handleWebScroll(index, x, y);
-        },
-        onReceivedError: (controller, request, error) {
-          if (index != _currentIndex) return;
-          setState(() => _isLoading = false);
-        },
-        onTitleChanged: (controller, title) {
-          if (title != null) tab.title = title;
-        },
-        // Capture any server-driven download (APK, PDF, zip, Content-Disposition, etc.).
-        onDownloadStartRequest: (controller, request) async {
-          final url = request.url.toString();
-          final suggested = request.suggestedFilename;
-          final displayName = (suggested != null && suggested.isNotEmpty)
-              ? suggested
-              : (Uri.tryParse(url)?.pathSegments.isNotEmpty == true
-                  ? Uri.parse(url).pathSegments.last
-                  : 'file');
-          final confirmed = await _showDownloadConfirmDialog(displayName);
-          if (confirmed == true) {
-            final taskId = await DownloadService.instance.enqueue(
-              url: url,
-              fileName: suggested,
-            );
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  content: Text(
-                    taskId != null
-                        ? 'Download started: $displayName'
-                        : 'Download failed to start',
-                  ),
-                  action: SnackBarAction(
-                    label: 'VIEW',
-                    textColor: MangaTheme.crimson,
-                    onPressed: _showDownloadsScreen,
-                  ),
-                ),
-              );
-            }
-          }
-        },
-      ),
-    );
-  }
-
-  Future<void> _goBack() async {
-    final controller = _currentTab.controller;
-    if (controller != null && await controller.canGoBack()) {
-      await controller.goBack();
-    }
-  }
-
-  /// Phone system back button / gesture:
-  /// 1) WebView history back if possible
-  /// 2) Otherwise leave the app
-  Future<void> _onSystemBack() async {
-    final controller = _currentTab.controller;
-    if (controller != null && await controller.canGoBack()) {
-      await controller.goBack();
-      return;
-    }
-    // No more pages in this tab → exit app
-    SystemNavigator.pop();
-  }
-
-  Future<void> _goForward() async {
-    final controller = _currentTab.controller;
-    if (controller != null && await controller.canGoForward()) {
-      await controller.goForward();
-    }
-  }
-
-  Future<void> _reloadOrStop() async {
-    final controller = _currentTab.controller;
-    if (controller == null) return;
-    if (_isLoading) {
-      await controller.stopLoading();
-    } else {
-      await controller.reload();
-    }
-  }
-
-  Future<void> _goHome() async {
-    final settings = context.read<BrowserSettings>();
-    await _handleSubmitted(settings.homePage);
-  }
-
-  void _showTabsScreen() {
-    Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => TabsScreen(
-          tabs: _tabs,
-          currentIndex: _currentIndex,
-          onSelect: (i) {
-            Navigator.pop(context);
-            _switchTab(i);
-          },
-          onClose: _closeTab,
-          onNewTab: () {
-            Navigator.pop(context);
-            _openNewTab();
-          },
-        ),
-      ),
-    );
-  }
-
-  void _showSettingsScreen() {
-    Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => const SettingsScreen()),
-    );
-  }
-
-  void _showHistoryScreen() {
-    Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => HistoryScreen(
-          onOpenUrl: (url) {
-            _handleSubmitted(url);
-          },
-        ),
-      ),
-    );
-  }
-
-  void _showDownloadsScreen() {
-    Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => const DownloadsScreen()),
     );
   }
 }

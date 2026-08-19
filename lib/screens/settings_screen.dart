@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../models/browser_settings.dart';
+import '../services/adblock_service.dart';
 import '../services/history_service.dart';
 import '../services/storage_service.dart';
 import '../services/system_settings_service.dart';
@@ -341,15 +342,112 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
           // ── Privacy ────────────────────────────────────────────────
           const _SectionHeader('PRIVACY'),
+          // Hardcore Privacy preset
+          Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: MangaContainer(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      const Icon(Icons.shield, color: MangaTheme.crimson, size: 28),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          'HARDCORE PRIVACY',
+                          style: TextStyle(
+                            fontWeight: FontWeight.w900,
+                            letterSpacing: 1.1,
+                            fontSize: 15,
+                            color: ink,
+                          ),
+                        ),
+                      ),
+                      if (s.isHardcorePrivacy)
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 3,
+                          ),
+                          decoration: BoxDecoration(
+                            color: MangaTheme.crimson,
+                            border: Border.all(color: ink, width: 2),
+                          ),
+                          child: Text(
+                            'ON',
+                            style: TextStyle(
+                              fontWeight: FontWeight.w900,
+                              fontSize: 11,
+                              color: paper,
+                              letterSpacing: 1,
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    s.isHardcorePrivacy
+                        ? 'Maximum shield active — ads, trackers, WebRTC, history & more locked down.'
+                        : 'One tap: ads, trackers, HTTPS, WebRTC, fingerprint guard, no history, clear-on-exit, incognito.',
+                    style: TextStyle(
+                      fontSize: 12,
+                      height: 1.35,
+                      fontWeight: FontWeight.w600,
+                      color: dim,
+                    ),
+                  ),
+                  if (!s.isHardcorePrivacy) ...[
+                    const SizedBox(height: 12),
+                    SizedBox(
+                      width: double.infinity,
+                      height: 44,
+                      child: ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: MangaTheme.crimson,
+                          foregroundColor: paper,
+                          elevation: 0,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.zero,
+                            side: BorderSide(color: ink, width: 3),
+                          ),
+                        ),
+                        onPressed: () async {
+                          await s.enableHardcorePrivacy();
+                          _snack('Hardcore Privacy · ON');
+                        },
+                        child: const Text(
+                          'ENABLE HARDCORE',
+                          style: TextStyle(
+                            fontWeight: FontWeight.w900,
+                            letterSpacing: 1.2,
+                            fontSize: 13,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
           MangaContainer(
             padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 4),
             child: Column(
               children: [
                 SwitchListTile(
                   title: const Text('Block ads'),
-                  subtitle: Text(
-                    'Local domain list',
-                    style: TextStyle(fontSize: 12, color: dim),
+                  subtitle: FutureBuilder<Map<String, int>>(
+                    future: AdBlockService.instance.stats(),
+                    builder: (context, snap) {
+                      final n = snap.data?['ads'] ?? '…';
+                      return Text(
+                        'Local list · $n domains',
+                        style: TextStyle(fontSize: 12, color: dim),
+                      );
+                    },
                   ),
                   value: s.adBlockEnabled,
                   onChanged: (v) =>
@@ -357,9 +455,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 SwitchListTile(
                   title: const Text('Block trackers'),
-                  subtitle: Text(
-                    'Local tracker list',
-                    style: TextStyle(fontSize: 12, color: dim),
+                  subtitle: FutureBuilder<Map<String, int>>(
+                    future: AdBlockService.instance.stats(),
+                    builder: (context, snap) {
+                      final n = snap.data?['trackers'] ?? '…';
+                      return Text(
+                        'Local list · $n domains',
+                        style: TextStyle(fontSize: 12, color: dim),
+                      );
+                    },
                   ),
                   value: s.trackerBlockEnabled,
                   onChanged: (v) =>
