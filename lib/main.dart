@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 
 import 'models/browser_settings.dart';
 import 'screens/browser_screen.dart';
+import 'screens/onboarding_screen.dart';
 import 'services/download_service.dart';
 import 'theme/manga_theme.dart';
 import 'utils/constants.dart';
@@ -95,7 +96,14 @@ class _InkAppState extends State<InkApp> with WidgetsBindingObserver {
             theme: MangaTheme.light,
             darkTheme: MangaTheme.dark,
             themeMode: mode,
-            home: const BrowserScreen(),
+            home: settings.onboardingDone
+                ? const BrowserScreen()
+                : OnboardingScreen(
+                    onFinished: () {
+                      // Rebuild so home switches to BrowserScreen
+                      // (settings already notified listeners via completeOnboarding)
+                    },
+                  ),
           );
         },
       ),
