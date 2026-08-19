@@ -15,6 +15,7 @@ REQUIRED_PERMISSIONS = [
     '<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>',
     '<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>',
     '<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>',
+    '<uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>',
     '<uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>',
     '<uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>',
     '<uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>',
