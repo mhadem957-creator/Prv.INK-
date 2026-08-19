@@ -444,7 +444,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     builder: (context, snap) {
                       final n = snap.data?['ads'] ?? '…';
                       return Text(
-                        'Local list · $n domains',
+                        'EasyList · $n domains',
                         style: TextStyle(fontSize: 12, color: dim),
                       );
                     },
@@ -460,7 +460,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     builder: (context, snap) {
                       final n = snap.data?['trackers'] ?? '…';
                       return Text(
-                        'Local list · $n domains',
+                        'EasyPrivacy · $n domains',
                         style: TextStyle(fontSize: 12, color: dim),
                       );
                     },
