@@ -52,4 +52,5 @@ class AppConstants {
   static const String prefsThemeMode = 'pref_theme_mode';
   static const String prefsBlockWebRtc = 'pref_block_webrtc';
   static const String prefsFingerprintGuard = 'pref_fingerprint_guard';
+  static const String prefsOnboardingDone = 'pref_onboarding_done';
 }
