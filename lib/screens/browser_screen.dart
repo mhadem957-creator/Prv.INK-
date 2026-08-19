@@ -105,7 +105,7 @@ const String _fingerprintGuardJs = r"""
     }
   } catch(e){}
 })();
-"""
+""";
 
 /// Main browser screen combining InAppWebView, AdBlock, DownloadService,
 /// MangaUrlBar and MangaBottomBar.
