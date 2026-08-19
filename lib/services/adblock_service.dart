@@ -6,6 +6,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// Builds WebView [ContentBlocker] rules from bundled domain lists + user
 /// custom domains.
 ///
+/// Lists are derived from EasyList (ads) and EasyPrivacy (trackers)
+/// network rules (`||domain^`), plus the original curated INK entries.
+/// Cosmetic filters (`##`) are not supported by WebView ContentBlockers.
+///
 /// Uses flutter_inappwebview's ContentBlocker API
 /// (WKContentRuleList on iOS / request filtering on Android).
 class AdBlockService {
