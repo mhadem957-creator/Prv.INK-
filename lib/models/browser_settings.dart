@@ -27,6 +27,7 @@ class BrowserSettings extends ChangeNotifier {
   bool clearDataOnExit = false;
   bool blockWebRtc = true;
   bool fingerprintGuard = true;
+  bool onboardingDone = false;
   int safeSearch = 0; // 0 off, 1 moderate, 2 strict
   /// 0 = system, 1 = light, 2 = dark
   int themeModeIndex = 0;
@@ -61,6 +62,7 @@ class BrowserSettings extends ChangeNotifier {
     clearDataOnExit = prefs.getBool(AppConstants.prefsClearOnExit) ?? false;
     blockWebRtc = prefs.getBool(AppConstants.prefsBlockWebRtc) ?? true;
     fingerprintGuard = prefs.getBool(AppConstants.prefsFingerprintGuard) ?? true;
+    onboardingDone = prefs.getBool(AppConstants.prefsOnboardingDone) ?? false;
     safeSearch = prefs.getInt(AppConstants.prefsSafeSearch) ?? 0;
     themeModeIndex = prefs.getInt(AppConstants.prefsThemeMode) ?? 0;
     _loaded = true;
@@ -174,6 +176,58 @@ class BrowserSettings extends ChangeNotifier {
   Future<void> toggleFingerprintGuard(bool v) async {
     fingerprintGuard = v;
     await _saveBool(AppConstants.prefsFingerprintGuard, v);
+  }
+
+
+  /// True when the strongest practical privacy set is active.
+  bool get isHardcorePrivacy =>
+      adBlockEnabled &&
+      trackerBlockEnabled &&
+      forceHttps &&
+      blockWebRtc &&
+      fingerprintGuard &&
+      blockPopups &&
+      !saveHistory &&
+      clearDataOnExit &&
+      cloakSearchBranding &&
+      dohEnabled &&
+      incognitoMode;
+
+  /// Enable the full privacy hardening preset in one shot.
+  /// Does not disable JavaScript (too destructive for normal browsing).
+  Future<void> enableHardcorePrivacy() async {
+    final prefs = await SharedPreferences.getInstance();
+    adBlockEnabled = true;
+    trackerBlockEnabled = true;
+    forceHttps = true;
+    blockWebRtc = true;
+    fingerprintGuard = true;
+    blockPopups = true;
+    saveHistory = false;
+    clearDataOnExit = true;
+    cloakSearchBranding = true;
+    dohEnabled = true;
+    incognitoMode = true;
+    // Keep JS on — hardcore without breaking the web
+    await Future.wait([
+      prefs.setBool(AppConstants.prefsAdBlockEnabled, true),
+      prefs.setBool(AppConstants.prefsTrackerBlockEnabled, true),
+      prefs.setBool(AppConstants.prefsForceHttps, true),
+      prefs.setBool(AppConstants.prefsBlockWebRtc, true),
+      prefs.setBool(AppConstants.prefsFingerprintGuard, true),
+      prefs.setBool(AppConstants.prefsBlockPopups, true),
+      prefs.setBool(AppConstants.prefsSaveHistory, false),
+      prefs.setBool(AppConstants.prefsClearOnExit, true),
+      prefs.setBool(AppConstants.prefsCloakSearch, true),
+      prefs.setBool(AppConstants.prefsDohEnabled, true),
+      prefs.setBool(AppConstants.prefsIncognito, true),
+    ]);
+    notifyListeners();
+  }
+
+  Future<void> completeOnboarding() async {
+    onboardingDone = true;
+    await _saveBool(AppConstants.prefsOnboardingDone, true);
   }
 
   /// 0 system · 1 light · 2 dark
